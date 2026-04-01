@@ -1,0 +1,19 @@
+order_id,product_name,quantity,deadline,priority,estimated_hours,required_machine_type
+ORD-1001,Aluminum Housing Type-B,500,2026-03-29T18:00:00,high,3.5,CNC
+ORD-1002,Steel Shaft S-200,300,2026-03-29T16:00:00,medium,2.0,CNC
+ORD-1003,Bracket Assembly Kit,1200,2026-03-29T17:00:00,high,5.0,assembly
+ORD-1004,Precision Connector Ring,800,2026-03-29T20:00:00,medium,4.0,CNC
+ORD-1005,Titanium Valve Block,150,2026-03-29T14:00:00,critical,6.0,CNC
+ORD-1006,Wiring Harness Sub-Assy,600,2026-03-29T18:00:00,low,2.0,assembly
+ORD-2001,Aluminum Housing Type-A,400,2026-03-30T15:00:00,high,3.0,CNC
+ORD-2002,Steel Shaft S-100,250,2026-03-30T14:00:00,medium,2.5,CNC
+ORD-2003,Precision Connector Ring,900,2026-03-30T18:00:00,low,4.0,CNC
+ORD-2004,Bracket Assembly Kit,1500,2026-03-30T10:00:00,critical,5.0,assembly
+ORD-2005,Motor Mount Sub-Assy,700,2026-03-30T16:00:00,high,4.0,assembly
+ORD-2006,Steel Shaft S-300,350,2026-03-30T17:00:00,medium,4.0,CNC
+ORD-3001,Aluminum Housing Type-C,600,2026-03-31T18:00:00,high,4.0,CNC
+ORD-3002,Titanium Valve Block,200,2026-03-31T12:00:00,critical,5.5,CNC
+ORD-3003,Wiring Harness Sub-Assy,800,2026-03-31T16:00:00,medium,2.5,assembly
+ORD-3004,Bracket Assembly Kit,1000,2026-03-31T17:00:00,low,4.5,assembly
+ORD-3005,Precision Connector Ring,450,2026-03-31T14:00:00,high,3.0,CNC
+ORD-3006,Motor Mount Sub-Assy,550,2026-03-31T20:00:00,medium,3.5,assembly
