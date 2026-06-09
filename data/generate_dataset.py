@@ -203,7 +203,6 @@ def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
         actual_start = planned_start + timedelta(minutes=start_jitter)
         actual_end = actual_start + timedelta(minutes=true_time)
 
-        scrap_qty = int(rng.poisson(0.3 * (true_time / max(mu, 1e-6))))  # plus long -> + de rebut
         record_created = actual_end + timedelta(minutes=rng.uniform(0.5, 5.0))
 
         rows.append({
@@ -220,7 +219,6 @@ def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
             "actual_start_ts": actual_start,
             "actual_end_ts": actual_end,
             "status": "done",
-            "scrap_qty": scrap_qty,
             "record_created_ts": record_created,
         })
 
@@ -312,7 +310,7 @@ def main() -> None:
             "diameter_mm", "material", "color", "quantity",
             "machine_id", "machine_type",
             "planned_start_ts", "actual_start_ts", "actual_end_ts",
-            "status", "scrap_qty", "record_created_ts", "_fr_dates"]
+            "status", "record_created_ts", "_fr_dates"]
     df = df[cols]
     df = format_timestamps(df)
 

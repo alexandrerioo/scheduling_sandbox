@@ -57,7 +57,7 @@ Afficher `head()`, `info()`, glossaire, volumétrie, courbe hebdo. Faire **réag
 > **À éliminer :**
 > - `actual_end_ts` — **définit** la cible (`cible = actual_end − actual_start`). Une fois la durée calculée, les deux horodatages réels sortent des features.
 > - `record_created_ts` — écrit ≈ à la fin de l'op (≈ `actual_end`) → **proxy de la cible**. Piège **subtil** (ressemble à une colonne d'audit inoffensive). ⭐ Le bon candidat le repère.
-> - `status` (running/aborted/done), `scrap_qty` — connus seulement **après** l'opération.
+> - `status` (running/aborted/done) — connu seulement **après** l'opération.
 > - **Piège profond** : toute feature d'historique (« durée moyenne par article ») calculée sur **tout** le dataset fuite le futur dans le passé. Doit être **strictement passée** (cf. B.2).
 > **À garder :** `planned_start_ts` (connu à la planification — calendrier, courbe d'apprentissage), les caractéristiques d'article (`diameter_mm`, `material`, `color`), `quantity`, `machine_*`. `actual_start_ts` n'est utilisable que si on assume un cadrage « prédiction au démarrage de l'op » — un bon candidat **explicite le moment de prédiction** (à la planification vs au démarrage).
 
@@ -157,5 +157,5 @@ Pour situer les réponses du candidat (généré par `data/generate_dataset.py`,
 - **Loi latente** : `setup + cadence·q` avec **coude économie d'échelle** à q>100 ; `cadence` et `setup` **dérivés des caractéristiques d'article** : `diameter_mm` (∝ diamètre^0.55) et `material` (Aluminium 0.80 / Acier 1.00 / Inox 1.25 / Titane 1.60) ; `color` **sans effet (leurre)** ; vitesses par type machine `CNC_FAST 0.70 / CNC_STD 1.00 / MANUAL 1.45 / ROBOT_CELL 0.85` ; bruit log-normal ~12 %.
 - **Dérive temporelle (rend le split temporel obligatoire)** : courbe d'apprentissage globale ; **`MCH-12` (ROBOT_CELL) n'apparaît qu'au jour 120** (2024-04-30) ; **ralentissement d'août ×1.10** (peu/pas vu en train → le test se dégrade).
 - **Baselines & modèle** : moyenne globale ≈ **218 min MAE** ; moyenne par article (agrégation) ≈ **188 min MAE** ; **HistGradientBoosting ≈ 39 min MAE** (split temporel 80/20). Avec `color` retiré : ≈ 40 min (inchangé → confirme le leurre). Avec seulement `diameter+material+quantity` : ≈ 64 min. Durée médiane ≈ 101 min, moyenne ≈ 231 min (longue traîne).
-- **Colonnes-pièges (fuite)** : `actual_end_ts` (définit la cible), `record_created_ts` (≈ heure de fin → proxy subtil), `status`, `scrap_qty` (+ historique non strictement passé).
+- **Colonnes-pièges (fuite)** : `actual_end_ts` (définit la cible), `record_created_ts` (≈ heure de fin → proxy subtil), `status` (+ historique non strictement passé).
 - **Saletés injectées** : ~4 % `actual_end_ts` manquant (running/aborted → pas de label) ; **92 formes de surface d'`article_ref` → 40 articles réels** (typos, casse, espaces, suffixe `-MM`, tiret manquant) ; ~63 lignes dupliquées (~1 %) ; ~60 durées ≤ 0 (~1 %, décalage horloge → à filtrer) ; **panne sur `MCH-04`** ~2 semaines (×5–12 sur les durées → outliers extrêmes, jusqu'à ~11 000 min) ; **dates au format FR `JJ/MM/AAAA` pour `MCH-07`** vs ISO ailleurs (aucun `to_datetime` unique ne parse correctement les deux).
