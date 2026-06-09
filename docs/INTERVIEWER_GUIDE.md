@@ -17,9 +17,9 @@
 |---|---|---|
 | **A** — Cadrage ordonnancement (flow shop) | objectif / variables / contraintes / heuristique. Clôt sur **[KEEP-1] check-list optimisation**. | 8 |
 | **Bridge** | « pour ordonnancer il faut connaître les durées → on ne les connaît pas → prédisons-les ». | 1 |
-| **B.1** — Données à l'écran | cible ? grain ? colonnes inutilisables → **[KEEP-2] détection de fuite** ; **[KEEP-3] données ERP incohérentes / gros fichier : que fait-on en premier ?** | 8 |
+| **B.1** — Données à l'écran | cible **à reconstruire** (pas de colonne durée) ? grain ? colonnes inutilisables → **[KEEP-2] détection de fuite** ; **[KEEP-3] données ERP incohérentes / gros fichier : que fait-on en premier ?** | 8 |
 | **B.2** — Le split | **[KEEP-4] split temporel vs aléatoire** (la question la plus discriminante). | 6 |
-| **B.3** — Modèle & features (léger) | baseline à battre + modèle + **[KEEP-5] RF qui surapprend → réduire la profondeur, pas n_estimators**. | 7 |
+| **B.3** — Modèle & features (léger) | features prédictives vs leurre (**[KEEP-5b] la couleur sert-elle ?**) + baseline (moyenne par article, agrégation) + modèle + **[KEEP-5] RF qui surapprend → réduire la profondeur, pas n_estimators**. | 7 |
 | **D.1** — Évaluation | métriques reliées au business + **[KEEP-6] 99 % d'accuracy sur pièces défectueuses**. | 5 |
 | **D.2** — Mise en prod + bouclage | bon en test / mauvais en prod → drift, skew, rappel fuite, monitoring ; reboucler sur l'ordonnanceur (Partie A). | 4 |
 
@@ -51,15 +51,15 @@ Montrer le tableau A/B/C × M1/M2. Laisser **60–90 s de silence** avant de rel
 
 Afficher `head()`, `info()`, glossaire, volumétrie, courbe hebdo. Faire **réagir** le candidat.
 
-**Cible & grain (attendu) :** la cible est `actual_processing_time_min`, au **grain de l'opération** `(of_id, step_no)` — c'est l'unité qu'ordonnance le planificateur. Ne pas agréger à l'OF (on perdrait le signal machine).
+**Cible & grain (attendu) :** la cible n'est **pas une colonne** — il faut la **reconstruire** : `durée = actual_end_ts − actual_start_ts`. Grain = **l'opération = l'OF** (1 OF = 1 opération). ⭐ Le bon candidat note tout de suite : (1) qu'il faut dériver la cible des horodatages, (2) qu'il faut **gérer les lignes sans `actual_end_ts`** (~4 %, statut running/aborted → pas de label) et les **durées ≤ 0** (~1 %, décalage d'horloge → à filtrer).
 
 > **[KEEP-2] Détection de fuite (leakage).** *« Quelles colonnes ne pourrez-vous PAS utiliser pour prédire, et pourquoi ? »*
 > **À éliminer :**
-> - `actual_end_ts` — **définit** la cible (`cible = actual_end − actual_start`). Piège évident.
-> - `delay_min` = `actual_end − planned_end` → **contient la cible**. Piège **subtil** (ressemble à un KPI inoffensif). ⭐ Le bon candidat le repère.
-> - `status` (running/aborted/done), `scrap_qty`, `record_created_ts` (≈ heure de fin pour les lignes terminées) — connus seulement **après** l'opération.
+> - `actual_end_ts` — **définit** la cible (`cible = actual_end − actual_start`). Une fois la durée calculée, les deux horodatages réels sortent des features.
+> - `record_created_ts` — écrit ≈ à la fin de l'op (≈ `actual_end`) → **proxy de la cible**. Piège **subtil** (ressemble à une colonne d'audit inoffensive). ⭐ Le bon candidat le repère.
+> - `status` (running/aborted/done), `scrap_qty` — connus seulement **après** l'opération.
 > - **Piège profond** : toute feature d'historique (« durée moyenne par article ») calculée sur **tout** le dataset fuite le futur dans le passé. Doit être **strictement passée** (cf. B.2).
-> **À garder :** `planned_*` (l'estimation du planificateur — légitime et c'est la baseline à battre), et `actual_start_ts` **uniquement** si on assume un cadrage « prédiction au démarrage de l'op ». Un bon candidat **explicite le moment de prédiction** (à la planification vs au démarrage).
+> **À garder :** `planned_start_ts` (connu à la planification — calendrier, courbe d'apprentissage), les caractéristiques d'article (`diameter_mm`, `material`, `color`), `quantity`, `machine_*`. `actual_start_ts` n'est utilisable que si on assume un cadrage « prédiction au démarrage de l'op » — un bon candidat **explicite le moment de prédiction** (à la planification vs au démarrage).
 
 > **[KEEP-3] Données incohérentes / gros fichier — que fait-on en premier ?** *« Le vrai fichier fait des dizaines de Go et ne tient pas en mémoire ; et il est incomplet/incohérent. Par quoi commencez-vous ? »*
 > **Attendu :** (1) **ingestion** par **streaming / chunking**, ou pousser le gros du travail vers un système fait pour (warehouse) en assumant le coût/perf — ne pas tout charger en RAM ; (2) avant de modéliser : **parler au client / à l'expert métier**, **profiler et quantifier** la casse (manquants, doublons, valeurs impossibles), **définir le "suffisamment bon"** pour l'usage, décider quoi **dropper / imputer / signaler**. Le réflexe « je parle au client » est le meilleur signal FDE.
@@ -79,9 +79,12 @@ Afficher `head()`, `info()`, glossaire, volumétrie, courbe hebdo. Faire **réag
 
 Le candidat nomme 2–3 features et un premier modèle. Pas de code attendu.
 
-- **Features leakage-safe :** `quantity` (et `log`), `article` (normalisé), `article_family`, `machine_type`, `machine_id`, calendrier issu de `planned_start_ts` (`mois`/`is_august`, `week_index` = capte la courbe d'apprentissage), `planned_duration_min`, et **historique strictement passé** (moyenne glissante par article / type machine, décalée d'un cran, recalculée dans les bornes du split).
-- **Baselines à battre :** (1) moyenne globale (nulle) ; (2) **le planificateur** `planned_duration_min` — *« est-on meilleur que l'existant ? »* (la vraie barre, ~**41 min de MAE**) ; (3) moyenne passée par article = `setup + cadence·q`, forte et interprétable.
-- **Modèle :** un **gradient boosting** (ex. `HistGradientBoostingRegressor`) capte les interactions article×type-machine et le coude à q>100 → **~18 min de MAE** ici (≈ −55 % vs planificateur). Le linéaire reste au niveau du planificateur (structure additive seulement). La cible est log-normale → discuter MAE/MAPE et/ou cible en `log`.
+- **Features leakage-safe :** caractéristiques d'article (`diameter_mm`, `material` — voir KEEP-5b pour `color`), `quantity` (et `log`), `article` (normalisé), `article_family`, `machine_type`, `machine_id`, calendrier issu de `planned_start_ts` (`mois`/`is_august`, `week_index` = capte la courbe d'apprentissage), et **historique strictement passé** (moyenne glissante par article / type machine, décalée d'un cran, recalculée dans les bornes du split).
+- **Baselines à battre :** (1) moyenne globale (nulle) ~**218 min de MAE** ; (2) **moyenne par article** obtenue par **agrégation** (plusieurs OF par article) ~**188 min de MAE** — la barre interprétable, *« est-on meilleur qu'un simple historique par référence ? »* ; bonus : moyenne par (article × tranche de quantité), bien plus forte. (Plus de temps standard planificateur dans ce jeu de données.)
+- **Modèle :** un **gradient boosting** (ex. `HistGradientBoostingRegressor`) capte les interactions diamètre/matière × type-machine × quantité (et le coude à q>100) → **~39 min de MAE** ici (≈ −80 % vs moyenne globale, −79 % vs moyenne par article). Le linéaire reste loin derrière (structure additive seulement). La cible est log-normale → discuter MAE/MAPE et/ou cible en `log`.
+
+> **[KEEP-5b] Feature prédictive vs leurre.** *« Parmi `diameter_mm`, `material` et `color` : lesquelles sont vraiment utiles, et comment le vérifiez-vous sans entraîner un modèle complet ? »*
+> **Attendu :** `diameter_mm` (plus gros → plus long) et `material` (Aluminium < Acier < Inox < Titane) **portent le signal** ; `color` est un **leurre** sans effet causal. Vérification : corrélation / boxplots de la durée par modalité, ou **importance de permutation**. ⭐ Signal fort : le candidat se méfie d'une corrélation fortuite (avec 40 articles, une couleur peut sembler « lente » par hasard parce qu'elle coïncide avec de gros diamètres / du titane → **confondeur**, pas causalité). Ajouter `color` ne change quasiment pas la MAE (~39 → ~40).
 
 > **[KEEP-5] RandomForest qui surapprend.** *« Votre Random Forest surapprend. Vous réduisez la profondeur des arbres ou le nombre d'arbres ? Justifiez. »*
 > **Attendu : réduire la profondeur** (`max_depth`) — les arbres profonds mémorisent, c'est la source de variance. **Ajouter des arbres n'augmente PAS le surapprentissage** en RF (le bagging moyenne et stabilise). Le candidat qui couperait `n_estimators` pour corriger le surapprentissage a le modèle mental du bagging à l'envers.
@@ -114,7 +117,7 @@ Noter chaque dimension de 1 à 5.
 | **Cadrage** | 20 % | Reformule le besoin business avant les maths ; fait émerger objectif/variables/contraintes ; transforme une demande floue en problème traitable. |
 | **Pragmatisme** | 20 % | Va au plus simple qui marche ; baseline/heuristique avant la sophistication ; sait quand « assez bon » suffit ; arbitre coût/effort. |
 | **Communication des arbitrages** | 20 % | Dit « ça dépend » *et* de quoi ; explique en langage responsable d'atelier ; défend un choix ET son alternative. |
-| **Rigueur / fuite** | 15 % | Attrape le piège du split temporel ; repère `delay_min` / la fuite d'historique ; doute d'un score trop beau ; distingue outlier et erreur. |
+| **Rigueur / fuite** | 15 % | Attrape le piège du split temporel ; repère `record_created_ts` / la fuite d'historique ; doute d'un score trop beau ; distingue outlier et erreur. |
 | **Sens business** | 15 % | Relie les métriques aux résultats usine ; refuse une histoire causale tirée d'une corrélation ; pèse défaut manqué vs fausse alerte ; reboucle prédiction → ordonnancement. |
 | **Autonomie / E2E** | 10 % | Mène le fil sans qu'on le tienne par la main ; pense cadrage→données→modèle→éval→prod→monitoring ; sait revenir vers le client. |
 
@@ -150,9 +153,9 @@ Une ligne de réponse-type chacune. À piocher, pas à dérouler.
 
 Pour situer les réponses du candidat (généré par `data/generate_dataset.py`, seed 42) :
 
-- **Grain / cible** : 1 ligne = 1 opération `(of_id, step_no)` ; cible `actual_processing_time_min`. ~21 290 lignes, 6 000 OF, période **2024-01-01 → 2024-09-01**.
-- **Loi latente** : `setup + cadence·q` avec **coude économie d'échelle** à q>100 ; vitesses par type machine `CNC_FAST 0.70 / CNC_STD 1.00 / MANUAL 1.45 / ROBOT_CELL 0.85` ; bruit log-normal ~12 %.
+- **Grain / cible** : 1 ligne = **1 OF = 1 opération** ; cible **non fournie** = `actual_end_ts − actual_start_ts` (en min). **6 090 lignes** (dont doublons), **6 000 OF**, **40 articles** (~150 OF/article → agrégation pertinente), période **2024-01-01 → 2024-08-31**.
+- **Loi latente** : `setup + cadence·q` avec **coude économie d'échelle** à q>100 ; `cadence` et `setup` **dérivés des caractéristiques d'article** : `diameter_mm` (∝ diamètre^0.55) et `material` (Aluminium 0.80 / Acier 1.00 / Inox 1.25 / Titane 1.60) ; `color` **sans effet (leurre)** ; vitesses par type machine `CNC_FAST 0.70 / CNC_STD 1.00 / MANUAL 1.45 / ROBOT_CELL 0.85` ; bruit log-normal ~12 %.
 - **Dérive temporelle (rend le split temporel obligatoire)** : courbe d'apprentissage globale ; **`MCH-12` (ROBOT_CELL) n'apparaît qu'au jour 120** (2024-04-30) ; **ralentissement d'août ×1.10** (peu/pas vu en train → le test se dégrade).
-- **`planned_duration_min`** : temps standard du planificateur, basé sur la **moyenne famille** (ignore le type machine et la dérive) → corrélé mais biaisé = **baseline à battre (~41 min MAE)**. GBM correct ≈ **18 min MAE** (val) / ~20 (test, qui inclut août).
-- **Colonnes-pièges (fuite)** : `actual_end_ts`, `delay_min`, `status`, `scrap_qty`, `record_created_ts` (+ historique non strictement passé). *Inclure `delay_min` fait tomber la MAE à ~7 min → drapeau rouge si non repéré.*
-- **Saletés injectées** : ~4 % cible manquante (running/aborted) ; **92 formes de surface d'`article_ref` → 40 articles réels** (typos, casse, espaces, suffixe `-MM`, tiret manquant) ; ~228 lignes dupliquées ; ~207 durées ≤ 0 (décalage horloge) ; **panne sur `MCH-04`** ~2 semaines (≈ ×8 sur les durées : 1086 vs 137 min) ; ~2 % d'OF aux étapes dans le désordre ; **dates au format FR `JJ/MM/AAAA` pour `MCH-07`** vs ISO ailleurs (aucun `to_datetime` unique ne parse correctement les deux).
+- **Baselines & modèle** : moyenne globale ≈ **218 min MAE** ; moyenne par article (agrégation) ≈ **188 min MAE** ; **HistGradientBoosting ≈ 39 min MAE** (split temporel 80/20). Avec `color` retiré : ≈ 40 min (inchangé → confirme le leurre). Avec seulement `diameter+material+quantity` : ≈ 64 min. Durée médiane ≈ 101 min, moyenne ≈ 231 min (longue traîne).
+- **Colonnes-pièges (fuite)** : `actual_end_ts` (définit la cible), `record_created_ts` (≈ heure de fin → proxy subtil), `status`, `scrap_qty` (+ historique non strictement passé).
+- **Saletés injectées** : ~4 % `actual_end_ts` manquant (running/aborted → pas de label) ; **92 formes de surface d'`article_ref` → 40 articles réels** (typos, casse, espaces, suffixe `-MM`, tiret manquant) ; ~63 lignes dupliquées (~1 %) ; ~60 durées ≤ 0 (~1 %, décalage horloge → à filtrer) ; **panne sur `MCH-04`** ~2 semaines (×5–12 sur les durées → outliers extrêmes, jusqu'à ~11 000 min) ; **dates au format FR `JJ/MM/AAAA` pour `MCH-07`** vs ISO ailleurs (aucun `to_datetime` unique ne parse correctement les deux).

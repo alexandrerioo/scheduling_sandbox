@@ -2,10 +2,14 @@
 Génère un jeu de données synthétique d'opérations de production (atelier flow-shop)
 pour l'exercice DS/ML de l'entretien Oplit.
 
-Grain : une ligne = une opération = (of_id, step_no) sur une machine.
-Cible  : actual_processing_time_min (durée réelle de l'opération).
+Grain : une ligne = un OF = une opération (1 OF = 1 opération, pas de gamme multi-étapes).
+Cible  : la durée réelle de l'opération, **non pré-calculée** -> à dériver des timestamps
+         (actual_end_ts - actual_start_ts). Volontairement absente du fichier.
 
 Le processus génératif est volontairement :
+  - piloté par des **caractéristiques d'article** observables (diametre, matiere) qui
+    sont de vraies features prédictives, plus une feature **leurre** (couleur) sans effet ;
+  - assorti de plusieurs OF par article -> l'agrégation par article a du sens (baseline) ;
   - riche en interactions (article x type machine x quantité) -> les arbres battent
     un modèle linéaire, mais ça reste interprétable ;
   - sujet à une dérive temporelle (courbe d'apprentissage, machine introduite en
@@ -13,7 +17,7 @@ Le processus génératif est volontairement :
     temporel est obligatoire ;
   - bruité et "sale" (valeurs manquantes, doublons, typos, outliers de panne...) ->
     le candidat doit nettoyer ;
-  - assorti de colonnes "pièges" qui fuitent la cible (delay_min, actual_end_ts...).
+  - assorti de colonnes "pièges" qui fuitent la cible (actual_end_ts, record_created_ts...).
 
 Reproductible : seed=42, sous-générateurs via rng.spawn() par étape pour que
 l'ajout de lignes plus tard ne rebatte pas les étapes précédentes.
@@ -36,7 +40,7 @@ SEED = 42
 T0 = datetime(2024, 1, 1)
 N_DAYS = 244  # 2024-01-01 -> 2024-08-31
 N_ARTICLES = 40
-N_OFS = 6000
+N_OFS = 6000  # 1 OF = 1 opération -> ~150 OF par article (agrégation pertinente)
 WORK_HOURS = (6, 22)  # opérations planifiées dans la journée
 
 MCH12_BORN_DAY = 120  # MCH-12 (ROBOT_CELL) n'existe pas avant ce jour
@@ -54,6 +58,19 @@ FAMILIES = {
     "Assemblage": {"base": 0.8, "setup": 10, "types": ["MANUAL", "ROBOT_CELL", "CNC_STD"]},
     "Finition":   {"base": 0.5, "setup": 8,  "types": ["MANUAL", "CNC_FAST"]},
 }
+
+# --- caractéristiques d'article ---
+# matiere : VRAIE feature (multiplie la difficulté d'usinage)
+MATERIALS = {
+    "Aluminium":     0.80,
+    "Acier":         1.00,
+    "Inox":          1.25,
+    "Titane":        1.60,
+}
+# couleur : LEURRE (aucun effet sur la durée -> doit ressortir comme inutile)
+COLORS = ["Rouge", "Bleu", "Vert", "Noir", "Gris", "Jaune"]
+DIAM_REF = 50.0   # mm de référence
+DIAM_ALPHA = 0.55  # exposant : la durée croît avec le diamètre, sous-linéairement
 
 # 12 machines -> 4 types ; MCH-12 naît au jour 120
 MACHINES = {
@@ -88,27 +105,47 @@ def season(date: datetime) -> float:
 # Entités (tirées une fois)
 # --------------------------------------------------------------------------- #
 def build_articles(rng) -> pd.DataFrame:
+    """Un article = une référence + ses caractéristiques (diametre, matiere, couleur).
+
+    diametre et matiere pilotent la difficulté latente (vraies features) ;
+    couleur est un leurre. Plusieurs OF référenceront le même article.
+    """
     fam_names = list(FAMILIES.keys())
+    materials = list(MATERIALS.keys())
     rows = []
     for i in range(N_ARTICLES):
         fam = fam_names[i % len(fam_names)]
         f = FAMILIES[fam]
         letter = fam[0].upper()
+
+        diameter = float(round(rng.uniform(8.0, 200.0), 1))     # mm
+        material = materials[int(rng.integers(0, len(materials)))]
+        color = COLORS[int(rng.integers(0, len(COLORS)))]        # leurre
+
+        diam_factor = (diameter / DIAM_REF) ** DIAM_ALPHA
+        mat_factor = MATERIALS[material]
+
+        # complexité (min/unité) et setup (min) DÉRIVÉS des caractéristiques
+        # + petit aléa propre à l'article (mais features ~prédictives)
+        c_a = f["base"] * diam_factor * mat_factor * rng.lognormal(0.0, 0.12)
+        s_a = f["setup"] * (0.6 + 0.4 * diam_factor) * rng.lognormal(0.0, 0.12)
+
         rows.append({
             "article_id": i,
-            "article_ref": f"ART-{letter}{i:02d}",      # référence canonique
+            "article_ref": f"ART-{letter}{i:02d}",  # référence canonique
             "article_family": fam,
-            "C_a": f["base"] * rng.lognormal(0.0, 0.25),  # complexité min/unité (latente)
-            "S_a": f["setup"] * rng.lognormal(0.0, 0.20),  # setup min (latent)
-            "fam_base": f["base"],                          # nominal connu du planificateur
-            "fam_setup": f["setup"],
+            "diameter_mm": diameter,
+            "material": material,
+            "color": color,
+            "C_a": c_a,    # complexité min/unité (latente, dérivée des features)
+            "S_a": s_a,    # setup min (latent, dérivé des features)
             "types": f["types"],
         })
     return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------- #
-# Génération des opérations
+# Génération des opérations (1 OF = 1 opération)
 # --------------------------------------------------------------------------- #
 def sample_quantity(rng) -> int:
     # mélange de petits lots (dominés par le setup) et gros lots (dominés par la cadence)
@@ -134,75 +171,58 @@ def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for of_idx in range(N_OFS):
         art = art_records[rng.integers(0, N_ARTICLES)]
-        n_steps = int(rng.integers(2, 6))
         of_day = int(rng.integers(0, N_DAYS))
         of_id = f"OF-2024-{of_idx:05d}"
 
-        # début planifié de l'OF
-        cursor = datetime_for(of_day, rng)
+        planned_start = datetime_for(of_day, rng)
+        t = (planned_start - T0).days
 
-        for step in range(1, n_steps + 1):
-            t = (cursor - T0).days
-            mtype = art["types"][int(rng.integers(0, len(art["types"])))]
-            # machines de ce type existantes à la date t (MCH-12 naît au jour 120)
-            candidates = [m for m in TYPE_TO_MACHINES[mtype]
-                          if not (m == "MCH-12" and t < MCH12_BORN_DAY)]
-            machine_id = candidates[int(rng.integers(0, len(candidates)))]
-            q = sample_quantity(rng)
+        mtype = art["types"][int(rng.integers(0, len(art["types"])))]
+        # machines de ce type existantes à la date t (MCH-12 naît au jour 120)
+        candidates = [m for m in TYPE_TO_MACHINES[mtype]
+                      if not (m == "MCH-12" and t < MCH12_BORN_DAY)]
+        machine_id = candidates[int(rng.integers(0, len(candidates)))]
+        q = sample_quantity(rng)
 
-            # --- temps réel latent ---
-            setup = art["S_a"] * SPEED[mtype]
-            per_unit = art["C_a"] * SPEED[mtype]
-            base = setup + per_unit_with_kink(per_unit, q)
-            drift = learn(machine_id, t) * season(cursor)
+        # --- temps réel latent ---
+        setup = art["S_a"] * SPEED[mtype]
+        per_unit = art["C_a"] * SPEED[mtype]
+        base = setup + per_unit_with_kink(per_unit, q)
+        drift = learn(machine_id, t) * season(planned_start)
 
-            # fenêtre de panne sur MCH-04
-            breakdown = 1.0
-            if (machine_id == BREAKDOWN_MACHINE
-                    and BREAKDOWN_START_DAY <= t < BREAKDOWN_START_DAY + BREAKDOWN_LEN_DAYS):
-                breakdown = rng.uniform(5.0, 12.0)
+        # fenêtre de panne sur MCH-04
+        breakdown = 1.0
+        if (machine_id == BREAKDOWN_MACHINE
+                and BREAKDOWN_START_DAY <= t < BREAKDOWN_START_DAY + BREAKDOWN_LEN_DAYS):
+            breakdown = rng.uniform(5.0, 12.0)
 
-            mu = base * drift * breakdown
-            true_time = mu * rng.lognormal(0.0, 0.12)  # bruit multiplicatif ~12%
+        mu = base * drift * breakdown
+        true_time = mu * rng.lognormal(0.0, 0.12)  # bruit multiplicatif ~12%
 
-            # --- estimation du planificateur (temps standard, biaisé) ---
-            # ne connaît que la famille + la quantité (pas la machine, ni la dérive)
-            planned_duration = (art["fam_setup"] + art["fam_base"] * q) * rng.normal(0.95, 0.08)
-            planned_duration = max(planned_duration, 1.0)
+        start_jitter = rng.exponential(8.0)  # min
+        actual_start = planned_start + timedelta(minutes=start_jitter)
+        actual_end = actual_start + timedelta(minutes=true_time)
 
-            planned_start = cursor
-            planned_end = planned_start + timedelta(minutes=planned_duration)
+        scrap_qty = int(rng.poisson(0.3 * (true_time / max(mu, 1e-6))))  # plus long -> + de rebut
+        record_created = actual_end + timedelta(minutes=rng.uniform(0.5, 5.0))
 
-            start_jitter = rng.exponential(8.0)  # min
-            actual_start = planned_start + timedelta(minutes=start_jitter)
-            actual_end = actual_start + timedelta(minutes=true_time)
-            delay_min = (actual_end - planned_end).total_seconds() / 60.0
-
-            scrap_qty = int(rng.poisson(0.3 * (true_time / max(mu, 1e-6))))  # plus long -> + de rebut
-            record_created = actual_end + timedelta(minutes=rng.uniform(0.5, 5.0))
-
-            rows.append({
-                "of_id": of_id,
-                "step_no": step,
-                "article_ref": art["article_ref"],
-                "article_family": art["article_family"],
-                "quantity": q,
-                "machine_id": machine_id,
-                "machine_type": mtype,
-                "planned_start_ts": planned_start,
-                "planned_end_ts": planned_end,
-                "planned_duration_min": round(planned_duration, 1),
-                "actual_start_ts": actual_start,
-                "actual_end_ts": actual_end,
-                "actual_processing_time_min": round(true_time, 1),
-                "delay_min": round(delay_min, 1),
-                "status": "done",
-                "scrap_qty": scrap_qty,
-                "record_created_ts": record_created,
-            })
-
-            # l'étape suivante démarre après celle-ci (+ petit transfert)
-            cursor = actual_end + timedelta(minutes=float(rng.integers(5, 60)))
+        rows.append({
+            "of_id": of_id,
+            "article_ref": art["article_ref"],
+            "article_family": art["article_family"],
+            "diameter_mm": art["diameter_mm"],
+            "material": art["material"],
+            "color": art["color"],
+            "quantity": q,
+            "machine_id": machine_id,
+            "machine_type": mtype,
+            "planned_start_ts": planned_start,
+            "actual_start_ts": actual_start,
+            "actual_end_ts": actual_end,
+            "status": "done",
+            "scrap_qty": scrap_qty,
+            "record_created_ts": record_created,
+        })
 
     return pd.DataFrame(rows)
 
@@ -214,34 +234,22 @@ def corrupt(rng, df: pd.DataFrame) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     n = len(df)
 
-    # 1) Étapes dans le désordre : pour ~2% des OF, on inverse les timestamps de 2 étapes
-    of_list = df["of_id"].unique()
-    flip_ofs = rng.choice(of_list, size=int(0.02 * len(of_list)), replace=False)
-    for of_id in flip_ofs:
-        idx = df.index[df["of_id"] == of_id].tolist()
-        if len(idx) >= 2:
-            a, b = idx[0], idx[1]
-            for col in ["actual_start_ts", "actual_end_ts"]:
-                df.loc[a, col], df.loc[b, col] = df.loc[b, col], df.loc[a, col]
-
-    # 2) Durées négatives / nulles (~1%) : décalage d'horloge
+    # 1) Durées négatives / nulles (~1%) : décalage d'horloge -> la durée dérivée
+    #    des timestamps devient <= 0 (le candidat doit filtrer)
     bad = rng.choice(n, size=int(0.01 * n), replace=False)
     for i in bad:
         if rng.random() < 0.5:
             df.loc[i, "actual_end_ts"] = df.loc[i, "actual_start_ts"] - timedelta(minutes=float(rng.integers(1, 30)))
         else:
             df.loc[i, "actual_end_ts"] = df.loc[i, "actual_start_ts"]
-        df.loc[i, "actual_processing_time_min"] = round(
-            (df.loc[i, "actual_end_ts"] - df.loc[i, "actual_start_ts"]).total_seconds() / 60.0, 1)
 
-    # 3) actual_end_ts / cible manquante (~4%) : opérations en cours / abandonnées
+    # 2) actual_end_ts manquant (~4%) : opérations en cours / abandonnées
+    #    -> la cible (dérivée) est inconnue
     miss = rng.choice(n, size=int(0.04 * n), replace=False)
     df.loc[miss, "actual_end_ts"] = pd.NaT
-    df.loc[miss, "actual_processing_time_min"] = np.nan
-    df.loc[miss, "delay_min"] = np.nan
     df.loc[miss, "status"] = rng.choice(["running", "aborted"], size=len(miss))
 
-    # 4) Typos / incohérences sur article_ref (~10% des lignes, sous-ensemble d'articles)
+    # 3) Typos / incohérences sur article_ref (~10% des lignes, sous-ensemble d'articles)
     refs = df["article_ref"].unique()
     dirty_refs = set(rng.choice(refs, size=max(1, len(refs) // 3), replace=False))
     dirty_mask = df["article_ref"].isin(dirty_refs) & (rng.random(n) < 0.30)
@@ -258,11 +266,11 @@ def corrupt(rng, df: pd.DataFrame) -> pd.DataFrame:
         else:
             df.loc[i, "article_ref"] = ref.replace("-", "")  # tiret manquant
 
-    # 5) Formats de date mélangés : les lignes d'une machine en JJ/MM/AAAA HH:MM (str)
+    # 4) Formats de date mélangés : les lignes d'une machine en JJ/MM/AAAA HH:MM (str)
     #    (fait sur une copie écrite plus tard -> on marque les lignes, conversion au write)
     df["_fr_dates"] = df["machine_id"] == "MCH-07"
 
-    # 6) Doublons (~1.5%) : exacts + quelques quasi-doublons (record_created_ts différent)
+    # 5) Doublons (~1.5%) : exacts + quelques quasi-doublons (record_created_ts différent)
     dup_idx = rng.choice(n, size=int(0.015 * n), replace=False)
     dups = df.loc[dup_idx].copy()
     near = rng.random(len(dups)) < 0.3
@@ -275,8 +283,7 @@ def corrupt(rng, df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Écriture
 # --------------------------------------------------------------------------- #
-TS_COLS = ["planned_start_ts", "planned_end_ts", "actual_start_ts",
-           "actual_end_ts", "record_created_ts"]
+TS_COLS = ["planned_start_ts", "actual_start_ts", "actual_end_ts", "record_created_ts"]
 
 
 def format_timestamps(df: pd.DataFrame) -> pd.DataFrame:
@@ -301,11 +308,11 @@ def main() -> None:
     df = corrupt(s_corrupt, df)
 
     # ordre des colonnes (figé)
-    cols = ["of_id", "step_no", "article_ref", "article_family", "quantity",
+    cols = ["of_id", "article_ref", "article_family",
+            "diameter_mm", "material", "color", "quantity",
             "machine_id", "machine_type",
-            "planned_start_ts", "planned_end_ts", "planned_duration_min",
-            "actual_start_ts", "actual_end_ts", "actual_processing_time_min",
-            "delay_min", "status", "scrap_qty", "record_created_ts", "_fr_dates"]
+            "planned_start_ts", "actual_start_ts", "actual_end_ts",
+            "status", "scrap_qty", "record_created_ts", "_fr_dates"]
     df = df[cols]
     df = format_timestamps(df)
 
@@ -318,7 +325,8 @@ def main() -> None:
     print(f"Lignes : {len(df)}  |  OF : {df['of_id'].nunique()}")
     print(f"Références article distinctes (surface) : {df['article_ref'].nunique()} "
           f"(canoniques attendues : {N_ARTICLES})")
-    print(f"Cibles manquantes : {df['actual_processing_time_min'].isna().sum()}")
+    print(f"OF moyens par article (canonique) : {N_OFS / N_ARTICLES:.0f}")
+    print(f"actual_end_ts manquants : {(df['actual_end_ts'] == '').sum()}")
     print(f"Période : {df['planned_start_ts'].min()} -> {df['planned_start_ts'].max()}")
 
 
