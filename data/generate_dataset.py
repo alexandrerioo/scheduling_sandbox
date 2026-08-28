@@ -9,7 +9,10 @@ Cible  : la durée réelle de l'opération, **non pré-calculée** -> à dérive
 Le processus génératif est volontairement :
   - piloté par des **caractéristiques d'article** observables (diametre, matiere) qui
     sont de vraies features prédictives, plus une feature **leurre** (couleur) sans effet ;
-  - assorti de plusieurs OF par article -> l'agrégation par article a du sens (baseline) ;
+  - assorti de plusieurs OF par article -> l'agrégation par article a du sens (baseline),
+    MAIS la volumétrie est déséquilibrée : quelques articles n'ont qu'une poignée d'OF
+    et d'autres n'apparaissent qu'en fin de période -> la moyenne par article ne suffit
+    pas, il faut un modèle qui généralise via les caractéristiques (diamètre/matière) ;
   - riche en interactions (article x type machine x quantité) -> les arbres battent
     un modèle linéaire, mais ça reste interprétable ;
   - sujet à une dérive temporelle (courbe d'apprentissage, machine introduite en
@@ -17,7 +20,8 @@ Le processus génératif est volontairement :
     temporel est obligatoire ;
   - bruité et "sale" (valeurs manquantes, doublons, typos, outliers de panne...) ->
     le candidat doit nettoyer ;
-  - assorti de colonnes "pièges" qui fuitent la cible (actual_end_ts, record_created_ts...).
+  - assorti de colonnes "pièges" qui fuitent la cible (actual_end_ts, record_created_ts,
+    downtime_min : connus seulement une fois l'opération terminée).
 
 Reproductible : seed=42, sous-générateurs via rng.spawn() par étape pour que
 l'ajout de lignes plus tard ne rebatte pas les étapes précédentes.
@@ -40,8 +44,17 @@ SEED = 42
 T0 = datetime(2024, 1, 1)
 N_DAYS = 244  # 2024-01-01 -> 2024-08-31
 N_ARTICLES = 40
-N_OFS = 6000  # 1 OF = 1 opération -> ~150 OF par article (agrégation pertinente)
+N_OFS = 6000  # 1 OF = 1 opération -> ~150 OF/article EN MOYENNE (mais volumétrie déséquilibrée)
 WORK_HOURS = (6, 22)  # opérations planifiées dans la journée
+
+# --- popularité déséquilibrée des articles ---
+# Volontaire : quelques articles ont très peu d'observations (moyenne par article
+# peu fiable) et certains n'apparaissent qu'en fin de période (cold-start dans le
+# test). -> on ne peut pas se contenter d'un groupby-moyenne ; il faut un modèle
+# qui généralise via les CARACTÉRISTIQUES d'article (diamètre, matière, famille).
+N_RARE_ARTICLES = 4        # articles à très faible volume (~2-6 OF chacun)
+N_COLDSTART_ARTICLES = 2   # articles présents UNIQUEMENT à partir de COLDSTART_DAY
+COLDSTART_DAY = 200        # ~derniers ~44 jours -> tombe dans la période de test
 
 MCH12_BORN_DAY = 120  # MCH-12 (ROBOT_CELL) n'existe pas avant ce jour
 BREAKDOWN_MACHINE = "MCH-04"
@@ -167,15 +180,44 @@ def datetime_for(day: int, rng) -> datetime:
 
 def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
     art_records = articles.to_dict("records")
+    n_art = len(art_records)
+
+    # --- popularité déséquilibrée + articles rares + cold-start ---
+    # Les derniers indices sont réservés : d'abord les rares, puis les cold-start.
+    cold_ids = set(range(n_art - N_COLDSTART_ARTICLES, n_art))
+    rare_ids = sorted(range(n_art - N_COLDSTART_ARTICLES - N_RARE_ARTICLES,
+                            n_art - N_COLDSTART_ARTICLES))
+
+    # Les articles rares reçoivent un nombre d'OF FIXE et minuscule (2-6) : présents
+    # mais avec une moyenne par article non fiable. Le reste du budget est réparti
+    # sur les autres articles avec un skew modéré (cold-start confiné en fin de période).
+    rare_sizes = [2, 3, 4, 6, 5, 8]
+    of_article = []
+    for idx, size in zip(rare_ids, rare_sizes):
+        of_article += [idx] * size
+
+    pool = [i for i in range(n_art) if i not in rare_ids]
+    w = rng.random(len(pool)) ** 1.5 + 0.10
+    for j, i in enumerate(pool):
+        if i in cold_ids:
+            w[j] = 0.05
+    w = w / w.sum()
+    of_article += list(rng.choice(pool, size=N_OFS - len(of_article), p=w))
+    of_article = np.asarray(of_article)
+    rng.shuffle(of_article)
 
     rows = []
     for of_idx in range(N_OFS):
-        art = art_records[rng.integers(0, N_ARTICLES)]
-        of_day = int(rng.integers(0, N_DAYS))
+        a_idx = int(of_article[of_idx])
+        art = art_records[a_idx]
+        if a_idx in cold_ids:
+            of_day = int(rng.integers(COLDSTART_DAY, N_DAYS))
+        else:
+            of_day = int(rng.integers(0, N_DAYS))
         of_id = f"OF-2024-{of_idx:05d}"
 
-        planned_start = datetime_for(of_day, rng)
-        t = (planned_start - T0).days
+        op_start = datetime_for(of_day, rng)   # début visé (non exporté)
+        t = (op_start - T0).days
 
         mtype = art["types"][int(rng.integers(0, len(art["types"])))]
         # machines de ce type existantes à la date t (MCH-12 naît au jour 120)
@@ -188,7 +230,7 @@ def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
         setup = art["S_a"] * SPEED[mtype]
         per_unit = art["C_a"] * SPEED[mtype]
         base = setup + per_unit_with_kink(per_unit, q)
-        drift = learn(machine_id, t) * season(planned_start)
+        drift = learn(machine_id, t) * season(op_start)
 
         # fenêtre de panne sur MCH-04
         breakdown = 1.0
@@ -199,8 +241,16 @@ def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
         mu = base * drift * breakdown
         true_time = mu * rng.lognormal(0.0, 0.12)  # bruit multiplicatif ~12%
 
+        # downtime réalisé PENDANT l'opération (pauses, micro-arrêts).
+        # PIÈGE / fuite : c'est une part du temps réel -> connu seulement a
+        # posteriori. Corrélé à la durée -> très tentant comme feature.
+        if rng.random() < 0.35:
+            downtime = true_time * rng.uniform(0.05, 0.35)
+        else:
+            downtime = 0.0
+
         start_jitter = rng.exponential(8.0)  # min
-        actual_start = planned_start + timedelta(minutes=start_jitter)
+        actual_start = op_start + timedelta(minutes=start_jitter)
         actual_end = actual_start + timedelta(minutes=true_time)
 
         record_created = actual_end + timedelta(minutes=rng.uniform(0.5, 5.0))
@@ -215,9 +265,9 @@ def generate_operations(rng, articles: pd.DataFrame) -> pd.DataFrame:
             "quantity": q,
             "machine_id": machine_id,
             "machine_type": mtype,
-            "planned_start_ts": planned_start,
             "actual_start_ts": actual_start,
             "actual_end_ts": actual_end,
+            "downtime_min": round(downtime, 1),
             "status": "done",
             "record_created_ts": record_created,
         })
@@ -281,7 +331,7 @@ def corrupt(rng, df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Écriture
 # --------------------------------------------------------------------------- #
-TS_COLS = ["planned_start_ts", "actual_start_ts", "actual_end_ts", "record_created_ts"]
+TS_COLS = ["actual_start_ts", "actual_end_ts", "record_created_ts"]
 
 
 def format_timestamps(df: pd.DataFrame) -> pd.DataFrame:
@@ -309,7 +359,7 @@ def main() -> None:
     cols = ["of_id", "article_ref", "article_family",
             "diameter_mm", "material", "color", "quantity",
             "machine_id", "machine_type",
-            "planned_start_ts", "actual_start_ts", "actual_end_ts",
+            "actual_start_ts", "actual_end_ts", "downtime_min",
             "status", "record_created_ts", "_fr_dates"]
     df = df[cols]
     df = format_timestamps(df)
@@ -325,7 +375,7 @@ def main() -> None:
           f"(canoniques attendues : {N_ARTICLES})")
     print(f"OF moyens par article (canonique) : {N_OFS / N_ARTICLES:.0f}")
     print(f"actual_end_ts manquants : {(df['actual_end_ts'] == '').sum()}")
-    print(f"Période : {df['planned_start_ts'].min()} -> {df['planned_start_ts'].max()}")
+    print(f"Période (actual_start_ts) : {df['actual_start_ts'].min()} -> {df['actual_start_ts'].max()}")
 
 
 if __name__ == "__main__":
