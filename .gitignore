@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Interviewer-only material (answer keys, notebook builder): never push, the repo is public
+docs/private/
